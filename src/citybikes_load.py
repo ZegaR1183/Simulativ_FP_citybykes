@@ -28,6 +28,10 @@ STATIONS_FILE = DATA_DIR / "stations_bicing.json"
 NETWORKS_TABLE = "e_raikhin_networks"
 STATIONS_TABLE = "e_raikhin_stations"
 
+# Размер пачки execute_values: держим в константе, чтобы лог про page_size
+# не расходился с реальным параметром вставки.
+BATCH_SIZE = 1000
+
 CREATE_TABLES_SQL = f"""
 CREATE TABLE IF NOT EXISTS {NETWORKS_TABLE} (
     id          TEXT PRIMARY KEY,
@@ -69,27 +73,38 @@ CREATE INDEX IF NOT EXISTS idx_{STATIONS_TABLE}_network
 
 def _read_json(path: Path):
     if not path.exists():
+        log.error("Файл с данными отсутствует: %s", path)
         raise FileNotFoundError(f"Файл не найден: {path}")
 
+    log.info("Читаем %s (%d байт)", path, path.stat().st_size)
     with path.open("r", encoding="utf-8") as f:
-        return json.load(f)
+        try:
+            data = json.load(f)
+        except json.JSONDecodeError:
+            log.exception("Файл %s не является корректным JSON", path)
+            raise
+
+    log.debug("Тип корневого элемента %s: %s", path.name, type(data).__name__)
+    return data
 
 
-def _to_int(value):
+def _to_int(value, *, field: str = "", context: str = ""):
     if value is None:
         return None
     try:
         return int(value)
     except (TypeError, ValueError):
+        log.warning("Не числовое значение %s=%r в %s — записываем NULL", field, value, context)
         return None
 
 
-def _to_float(value):
+def _to_float(value, *, field: str = "", context: str = ""):
     if value is None:
         return None
     try:
         return float(value)
     except (TypeError, ValueError):
+        log.warning("Не числовое значение %s=%r в %s — записываем NULL", field, value, context)
         return None
 
 
@@ -117,13 +132,26 @@ def _station_id(station: dict) -> str:
     if isinstance(extra, dict):
         sid = extra.get("id") or extra.get("uid")
         if sid is not None:
+            log.debug("Станция %r: id взят из extra (id/uid)", station.get("name"))
             return str(sid)
 
+    # Ни одного id не найдено — генерируем детерминированный, иначе PK не соберётся.
     raw = f"{station.get('name')}|{station.get('latitude')}|{station.get('longitude')}"
-    return "hash_" + hashlib.md5(raw.encode("utf-8")).hexdigest()
+    generated = "hash_" + hashlib.md5(raw.encode("utf-8")).hexdigest()
+    log.warning(
+        "У станции %r нет id и extra.id/uid — суррогатный ключ %s",
+        station.get("name"),
+        generated,
+    )
+    return generated
 
 
-def create_tables():
+def create_tables(**context):
+    log.info(
+        "Создаём таблицы в БД (conn_id=%s, run_id=%s)",
+        POSTGRES_CONN_ID,
+        context.get("run_id", "-"),
+    )
     hook = PostgresHook(postgres_conn_id=POSTGRES_CONN_ID)
     conn = hook.get_conn()
     try:
@@ -133,27 +161,47 @@ def create_tables():
         log.info("Таблицы %s и %s созданы/обновлены", NETWORKS_TABLE, STATIONS_TABLE)
     except Exception:
         conn.rollback()
+        log.exception("Не удалось создать таблицы %s/%s", NETWORKS_TABLE, STATIONS_TABLE)
         raise
     finally:
         conn.close()
 
 
-def load_networks():
+def load_networks(**context):
     data = _read_json(NETWORKS_FILE)
 
     networks = data.get("networks", []) if isinstance(data, dict) else data
     if not isinstance(networks, list):
+        log.error(
+            "В %s ожидается список сетей, получен %s — данных нет",
+            NETWORKS_FILE.name,
+            type(networks).__name__,
+        )
         networks = []
 
+    log.info("В %s найдено сетей: %d", NETWORKS_FILE.name, len(networks))
+
     rows = []
+    skipped_no_id = 0
+    seen_ids = set()
+    duplicates = 0
     for net in networks:
         if not isinstance(net, dict):
+            log.warning("Пропуск элемента сети: ожидался объект, получен %s", type(net).__name__)
             continue
 
         net_id = net.get("id")
         if net_id is None:
+            skipped_no_id += 1
             log.warning("Пропуск сети без id: %s", net.get("name"))
             continue
+
+        net_id = str(net_id)
+        if net_id in seen_ids:
+            # ON CONFLICT упасёт от падения, но дубль в источнике — это аномалия.
+            duplicates += 1
+            log.warning("Дубликат сети id=%s (%s) в исходном файле", net_id, net.get("name"))
+        seen_ids.add(net_id)
 
         company = net.get("company")
         if isinstance(company, str):
@@ -170,7 +218,7 @@ def load_networks():
             license_obj = None
 
         rows.append((
-            str(net_id),
+            net_id,
             net.get("name"),
             _as_jsonb(net.get("location")),
             net.get("href"),
@@ -186,9 +234,14 @@ def load_networks():
             Json(net),  # сохраняем исходный объект целиком
         ))
 
+    if skipped_no_id:
+        log.warning("Пропущено сетей без id: %d", skipped_no_id)
+    if duplicates:
+        log.warning("Дублирующихся id в источнике: %d", duplicates)
+
     if not rows:
-        log.warning("В %s нет валидных сетей", NETWORKS_FILE)
-        return
+        log.warning("В %s нет валидных сетей — нечего загружать", NETWORKS_FILE.name)
+        return {"networks_loaded": 0}
 
     insert_sql = f"""
         INSERT INTO {NETWORKS_TABLE}
@@ -216,14 +269,18 @@ def load_networks():
     conn = hook.get_conn()
     try:
         with conn.cursor() as cur:
-            execute_values(cur, insert_sql, rows, page_size=1000)
+            log.info("Вставляем сети пачками по %d строк (всего %d)", BATCH_SIZE, len(rows))
+            execute_values(cur, insert_sql, rows, page_size=BATCH_SIZE)
         conn.commit()
         log.info("Загружено/обновлено сетей: %d", len(rows))
     except Exception:
         conn.rollback()
+        log.exception("Загрузка сетей в %s отменена (rollback)", NETWORKS_TABLE)
         raise
     finally:
         conn.close()
+
+    return {"networks_loaded": len(rows)}
 
 
 def _network_id_from_filename(path: Path) -> str | None:
@@ -247,7 +304,7 @@ def _pick(station: dict, *keys):
     return None
 
 
-def load_stations():
+def load_stations(**context):
     data = _read_json(STATIONS_FILE)
 
     if isinstance(data, dict):
@@ -261,15 +318,32 @@ def load_stations():
     stations = network_obj.get("stations", [])
 
     if network_id is None:
-        log.error("Не удалось определить network_id в %s", STATIONS_FILE)
+        log.error(
+            "Не удалось определить network_id: в %s нет ни network.id, "
+            "ни префикса stations_ в имени файла",
+            STATIONS_FILE.name,
+        )
         raise ValueError("network_id не найден")
 
     network_id = str(network_id)
-    log.info("Обрабатываем станции сети %s из %s", network_id, STATIONS_FILE)
+    if not network_obj.get("id"):
+        log.info("network_id=%s выведен из имени файла %s", network_id, STATIONS_FILE.name)
+    else:
+        log.info("network_id=%s взят из блока network.id", network_id)
 
-    if not isinstance(stations, list) or not stations:
-        log.warning("Для сети %s нет станций в %s", network_id, STATIONS_FILE)
-        return
+    if not isinstance(stations, list):
+        log.error(
+            "Для сети %s ожидается список станций, получен %s — данных нет",
+            network_id,
+            type(stations).__name__,
+        )
+        stations = []
+
+    log.info("В %s найдено станций: %d", STATIONS_FILE.name, len(stations))
+
+    if not stations:
+        log.warning("Для сети %s нет станций в %s", network_id, STATIONS_FILE.name)
+        return {"network_id": network_id, "stations_loaded": 0}
 
     hook = PostgresHook(postgres_conn_id=POSTGRES_CONN_ID)
     conn = hook.get_conn()
@@ -280,21 +354,45 @@ def load_stations():
                 (network_id,),
             )
             if cur.fetchone() is None:
-                log.warning(
-                    "Сеть %s не найдена в %s, станции пропущены",
+                log.error(
+                    "Сеть %s не найдена в %s (шаг load_networks не выполнился или "
+                    "сеть отсутствует в выгрузке) — станции не загружены",
                     network_id,
                     NETWORKS_TABLE,
                 )
-                return
+                return {"network_id": network_id, "stations_loaded": 0}
 
         rows = []
+        skipped_not_dict = 0
+        skipped_no_coords = 0
+        seen_ids = set()
+        duplicates = 0
         for station in stations:
             if not isinstance(station, dict):
+                skipped_not_dict += 1
                 continue
 
             sid = _station_id(station)
             if not sid:
+                skipped_not_dict += 1
+                log.warning("Пропуск станции без идентификатора: %r", station)
                 continue
+
+            if sid in seen_ids:
+                duplicates += 1
+                log.warning("Дубликат станции id=%s (%s) в исходном файле", sid, station.get("name"))
+            seen_ids.add(sid)
+
+            latitude = _to_float(station.get("latitude"), field="latitude", context=f"станция {sid}")
+            longitude = _to_float(station.get("longitude"), field="longitude", context=f"станция {sid}")
+            if latitude is None or longitude is None:
+                skipped_no_coords += 1
+                log.warning(
+                    "Станция %s (%s): широта/долгота отсутствуют или нечисловые — "
+                    "пишем NULL в latitude/longitude",
+                    sid,
+                    station.get("name"),
+                )
 
             extra = station.get("extra")
 
@@ -302,19 +400,37 @@ def load_stations():
                 sid,
                 network_id,
                 station.get("name"),
-                _to_float(station.get("latitude")),
-                _to_float(station.get("longitude")),
+                latitude,
+                longitude,
                 station.get("timestamp"),
                 # в выгрузке bicing свободные велосипеды — "bikes", слоты — "free"
-                _to_int(_pick(station, "free_bikes", "bikes", "num_bikes_available")),
-                _to_int(_pick(station, "empty_slots", "free", "num_docks_available")),
+                _to_int(
+                    _pick(station, "free_bikes", "bikes", "num_bikes_available"),
+                    field="free_bikes",
+                    context=f"станция {sid}",
+                ),
+                _to_int(
+                    _pick(station, "empty_slots", "free", "num_docks_available"),
+                    field="empty_slots",
+                    context=f"станция {sid}",
+                ),
                 _as_jsonb(extra),
                 Json(station),
             ))
 
+        if skipped_not_dict:
+            log.warning("Пропущено записей станций (не объект или без id): %d", skipped_not_dict)
+        if skipped_no_coords:
+            log.warning(
+                "Станций без корректных координат: %d (загружены с NULL в latitude/longitude)",
+                skipped_no_coords,
+            )
+        if duplicates:
+            log.warning("Дублирующихся id станций в источнике: %d", duplicates)
+
         if not rows:
-            log.warning("Для сети %s нет валидных станций", network_id)
-            return
+            log.error("Для сети %s не сформировано ни одной валидной станции", network_id)
+            return {"network_id": network_id, "stations_loaded": 0}
 
         insert_sql = f"""
             INSERT INTO {STATIONS_TABLE}
@@ -334,14 +450,18 @@ def load_stations():
         """
 
         with conn.cursor() as cur:
-            execute_values(cur, insert_sql, rows, page_size=1000)
+            log.info("Вставляем станции пачками по %d строк (всего %d)", BATCH_SIZE, len(rows))
+            execute_values(cur, insert_sql, rows, page_size=BATCH_SIZE)
         conn.commit()
         log.info("Загружено/обновлено станций для сети %s: %d", network_id, len(rows))
     except Exception:
         conn.rollback()
+        log.exception("Загрузка станций сети %s в %s отменена (rollback)", network_id, STATIONS_TABLE)
         raise
     finally:
         conn.close()
+
+    return {"network_id": network_id, "stations_loaded": len(rows)}
 
 
 default_args = {
