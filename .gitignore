@@ -1,0 +1,13 @@
+.idea
+.venv
+
+# Локальные креды стенда (в репозиторий не попадают, есть .env.example)
+.env
+
+# Артефакты Airflow: ./src смонтирован как dags_folder, ./logs и ./config
+# создаются контейнером.
+__pycache__/
+*.pyc
+logs/
+config/
+plugins/

@@ -1,0 +1,4 @@
+# 2.9.10+ — первая версия с готовыми wheels под Python 3.13/3.14
+psycopg2-binary>=2.9.10,<3
+python-dotenv>=1.0.1,<2
+pytest==8.3.3

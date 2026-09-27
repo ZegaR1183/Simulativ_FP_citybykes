@@ -1,0 +1,240 @@
+# Airflow 3.1.8 + PostgreSQL для проекта CityBikes.
+#
+# Executor — LocalExecutor: в проекте один DAG и один узел, celery-worker + redis
+# дали бы только ~1.5 ГБ лишней RAM без какого-либо выигрыша.
+#
+# В стенде ДВЕ разные базы, их нельзя путать:
+#   postgres     - метаданные самого Airflow (airflow/airflow/airflow)
+#   citybikes-db - витрина проекта, куда пишет DAG (citybikes/citybikes)
+#
+# Быстрый старт:
+#   cp .env.example .env      # и проверить AIRFLOW_UID=$(id -u)
+#   docker compose up -d
+#   UI: http://localhost:8080 (airflow/airflow)
+---
+x-airflow-common:
+  &airflow-common
+  # Dockerfile в проекте не строим: всё нужное (apache-airflow-providers-standard,
+  # -postgres, psycopg2-binary) уже есть в официальном образе.
+  # Если появится сторонний пакет — закомментируйте image и раскомментируйте build.
+  image: ${AIRFLOW_IMAGE_NAME:-apache/airflow:3.1.8}
+  # build: .
+  env_file:
+    - ${ENV_FILE_PATH:-.env}
+  environment:
+    &airflow-common-env
+    AIRFLOW__CORE__EXECUTOR: LocalExecutor
+    AIRFLOW__CORE__AUTH_MANAGER: airflow.providers.fab.auth_manager.fab_auth_manager.FabAuthManager
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres:5432/airflow
+    AIRFLOW__CORE__FERNET_KEY: ''
+    AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: 'true'
+    AIRFLOW__CORE__LOAD_EXAMPLES: 'false'
+    AIRFLOW__CORE__EXECUTION_API_SERVER_URL: 'http://airflow-apiserver:8080/execution/'
+    AIRFLOW__API_AUTH__JWT_SECRET: ${AIRFLOW__API_AUTH__JWT_SECRET:-airflow_jwt_secret}
+    AIRFLOW__API_AUTH__JWT_ISSUER: ${AIRFLOW__API_AUTH__JWT_ISSUER:-airflow}
+    # Health-check scheduler'а через встроенный http-сервер.
+    AIRFLOW__SCHEDULER__ENABLE_HEALTH_CHECK: 'true'
+    AIRFLOW_CONFIG: '/opt/airflow/config/airflow.cfg'
+
+    # --- Проект CityBikes -------------------------------------------------
+    # DAG лежит в src/, отдельная папка dags/ не заводится, чтобы не держать
+    # две копии одного файла. В Airflow 3 core.dags_folder задаёт bundle
+    # "dags-folder", поэтому этого достаточно.
+    AIRFLOW__CORE__DAGS_FOLDER: '/opt/airflow/src'
+    # PostgresHook("postgres_default") в DAG'е обязан писать в витрину проекта,
+    # а не в базу метаданных Airflow. Airflow читает соединения из переменных
+    # окружения AIRFLOW_CONN_*, поэтому переопределяем postgres_default здесь.
+    AIRFLOW_CONN_POSTGRES_DEFAULT: 'postgresql://${POSTGRES_USER:-citybikes}:${POSTGRES_PASSWORD:-citybikes}@citybikes-db:5432/${POSTGRES_DB:-citybikes}'
+    POSTGRES_CONN_ID: 'postgres_default'
+    # Каталог JSON по умолчанию в src/citybikes_load.py — /opt/airflow/data.
+    CITYBIKES_DATA_DIR: '/opt/airflow/data'
+  volumes:
+    - ${AIRFLOW_PROJ_DIR:-.}/src:/opt/airflow/src
+    - ${AIRFLOW_PROJ_DIR:-.}/data:/opt/airflow/data:ro
+    - ${AIRFLOW_PROJ_DIR:-.}/logs:/opt/airflow/logs
+    - ${AIRFLOW_PROJ_DIR:-.}/config:/opt/airflow/config
+    - ${AIRFLOW_PROJ_DIR:-.}/plugins:/opt/airflow/plugins
+  user: "${AIRFLOW_UID:-1000}:0"
+  depends_on:
+    &airflow-common-depends-on
+    postgres:
+      condition: service_healthy
+    citybikes-db:
+      condition: service_healthy
+
+services:
+  # База метаданных Airflow (даги, запуски, задачи, соединения).
+  postgres:
+    image: postgres:18.3
+    environment:
+      POSTGRES_USER: airflow
+      POSTGRES_PASSWORD: airflow
+      POSTGRES_DB: airflow
+    # В postgres:18 кластер лежит вложенно ($PGDATA=/var/lib/postgresql/18/docker),
+    # поэтому том монтируется в родителя, а не в .../data — иначе БД не переживает
+    # пересоздание контейнера.
+    volumes:
+      - airflow-postgres-data:/var/lib/postgresql
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "airflow"]
+      interval: 10s
+      retries: 5
+      start_period: 5s
+    restart: always
+
+  # Витрина CityBikes: таблицы e_raikhin_networks, e_raikhin_stations.
+  citybikes-db:
+    image: postgres:18.3
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-citybikes}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-citybikes}
+      POSTGRES_DB: ${POSTGRES_DB:-citybikes}
+    ports:
+      # 5433: хостовый 5432 занят контейнером citybikes_pg из прошлой практики.
+      - "${POSTGRES_HOST_PORT:-5433}:5432"
+    volumes:
+      - citybikes-db-data:/var/lib/postgresql
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "${POSTGRES_USER:-citybikes}"]
+      interval: 10s
+      retries: 5
+      start_period: 5s
+    restart: always
+
+  airflow-apiserver:
+    <<: *airflow-common
+    command: api-server
+    ports:
+      - "8080:8080"
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8080/api/v2/monitor/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    restart: always
+    depends_on:
+      <<: *airflow-common-depends-on
+      airflow-init:
+        condition: service_completed_successfully
+
+  airflow-scheduler:
+    <<: *airflow-common
+    command: scheduler
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8974/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    restart: always
+    depends_on:
+      <<: *airflow-common-depends-on
+      airflow-init:
+        condition: service_completed_successfully
+
+  airflow-dag-processor:
+    <<: *airflow-common
+    command: dag-processor
+    healthcheck:
+      test: ["CMD-SHELL", 'airflow jobs check --job-type DagProcessorJob --hostname "$${HOSTNAME}"']
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    restart: always
+    depends_on:
+      <<: *airflow-common-depends-on
+      airflow-init:
+        condition: service_completed_successfully
+
+  airflow-triggerer:
+    <<: *airflow-common
+    command: triggerer
+    healthcheck:
+      test: ["CMD-SHELL", 'airflow jobs check --job-type TriggererJob --hostname "$${HOSTNAME}"']
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    restart: always
+    depends_on:
+      <<: *airflow-common-depends-on
+      airflow-init:
+        condition: service_completed_successfully
+
+  # Разовый сервис: миграции метаданных, пользователь UI, права на тома.
+  airflow-init:
+    <<: *airflow-common
+    entrypoint: /bin/bash
+    command:
+      - -c
+      - |
+        if [[ -z "${AIRFLOW_UID}" ]]; then
+          echo
+          echo -e "\033[1;33mWARNING!!!: AIRFLOW_UID not set!\e[0m"
+          echo "On Linux run 'id -u' and put the value into .env as AIRFLOW_UID,"
+          echo "otherwise files in ./logs and ./config will be owned by root."
+          echo
+          export AIRFLOW_UID=$$(id -u)
+        fi
+        one_meg=1048576
+        mem_available=$$(($$(getconf _PHYS_PAGES) * $$(getconf PAGE_SIZE) / one_meg))
+        cpus_available=$$(grep -cE 'cpu[0-9]+' /proc/stat)
+        if (( mem_available < 4000 )) ; then
+          echo -e "\033[1;33mWARNING!!!: Not enough memory for Airflow (4GB+ needed).\e[0m"
+        fi
+        if (( cpus_available < 2 )) ; then
+          echo -e "\033[1;33mWARNING!!!: Not enough CPUs for Airflow (2+ recommended).\e[0m"
+        fi
+        echo
+        echo "Airflow version:"
+        /entrypoint airflow version
+        echo
+        echo "Creating default config file if missing:"
+        /entrypoint airflow config list >/dev/null
+        echo
+        # Только записываемые тома: ./data смонтирован read-only, chown по нему
+        # падал бы с "Read-only file system".
+        echo "Changing ownership of writable volumes to ${AIRFLOW_UID}:0"
+        chown -R "${AIRFLOW_UID}:0" /opt/airflow/logs /opt/airflow/config /opt/airflow/plugins
+        echo
+        echo "Waiting for the CityBikes database to accept queries..."
+        until pg_isready -h citybikes-db -U "${POSTGRES_USER:-citybikes}" -d "${POSTGRES_DB:-citybikes}"; do
+          sleep 2
+        done
+        echo
+        echo "DAG import check:"
+        /entrypoint airflow dags list-import-errors
+        echo
+        echo "Connection used by the DAG (must point at citybikes-db):"
+        /entrypoint airflow connections get postgres_default
+        echo
+        echo "Init done."
+    environment:
+      <<: *airflow-common-env
+      _AIRFLOW_DB_MIGRATE: 'true'
+      _AIRFLOW_WWW_USER_CREATE: 'true'
+      _AIRFLOW_WWW_USER_USERNAME: ${_AIRFLOW_WWW_USER_USERNAME:-airflow}
+      _AIRFLOW_WWW_USER_PASSWORD: ${_AIRFLOW_WWW_USER_PASSWORD:-airflow}
+      _PIP_ADDITIONAL_REQUIREMENTS: ''
+    user: "0:0"
+
+  # docker compose run --rm airflow-cli dags list-import-errors
+  airflow-cli:
+    <<: *airflow-common
+    profiles:
+      - debug
+    environment:
+      <<: *airflow-common-env
+      CONNECTION_CHECK_MAX_COUNT: "0"
+    command:
+      - bash
+      - -c
+      - airflow
+    depends_on:
+      <<: *airflow-common-depends-on
+
+volumes:
+  airflow-postgres-data:
+  citybikes-db-data:
